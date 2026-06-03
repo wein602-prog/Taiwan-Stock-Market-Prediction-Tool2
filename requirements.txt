@@ -1,0 +1,9 @@
+streamlit==1.32.0
+yfinance
+pandas
+numpy
+matplotlib
+prophet
+gnews
+requests
+holidays

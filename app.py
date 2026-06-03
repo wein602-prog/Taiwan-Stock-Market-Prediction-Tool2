@@ -1,0 +1,269 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from prophet import Prophet
+from datetime import datetime, timedelta
+from gnews import GNews
+import requests
+import holidays
+import matplotlib.font_manager as fm
+import os
+
+# --- 網頁設定 ---
+st.set_page_config(page_title="AI 股票決策指揮中心", page_icon="📈", layout="centered")
+st.title("📈 AI 股票預測與決策指揮中心")
+
+# --- 字型下載與設定 (使用 st.cache_resource 避免重複下載) ---
+@st.cache_resource
+def load_font():
+    font_url = 'https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf'
+    font_path = 'NotoSansCJKtc-Regular.otf'
+    if not os.path.exists(font_path):
+        response = requests.get(font_url)
+        with open(font_path, 'wb') as f:
+            f.write(response.content)
+    fm.fontManager.addfont(font_path)
+    custom_font = fm.FontProperties(fname=font_path)
+    plt.rcParams['font.sans-serif'] = custom_font.get_name() 
+    plt.rcParams['axes.unicode_minus'] = False 
+
+load_font()
+
+# --- 側邊欄：使用者輸入 ---
+st.sidebar.header("設定區")
+ticker_symbol = st.sidebar.text_input("請輸入股票代號 (例如: 2887.TW)", value="2887.TW")
+analyze_button = st.sidebar.button("🚀 開始分析")
+
+# --- 主程式區塊 ---
+if analyze_button:
+    with st.spinner(f"正在連線伺服器，全力運算 {ticker_symbol} 的數據中..."):
+        
+        # ==========================================
+        # 1. 取得股價資料與中文名稱
+        # ==========================================
+        ticker = yf.Ticker(ticker_symbol)
+        stock_data = ticker.history(period="2y")
+        
+        if stock_data.empty:
+            st.error(f"❌ 無法從 Yahoo Finance 取得 {ticker_symbol} 的股價資料！請確認代號是否正確。")
+            st.stop()
+            
+        stock_id = ticker_symbol.replace(".TW", "").replace(".TWO", "")
+        
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            url = f"https://tw.stock.yahoo.com/quote/{stock_id}"
+            res = requests.get(url, headers=headers, timeout=5)
+            start_idx = res.text.find('<title>') + 7
+            end_idx = res.text.find('</title>')
+            chinese_name = res.text[start_idx:end_idx].split('(')[0].strip()
+            display_name = f"{ticker_symbol} {chinese_name}" if "Yahoo" not in chinese_name else ticker_symbol
+            stock_name_for_news = chinese_name if "Yahoo" not in chinese_name else stock_id
+        except:
+            display_name = ticker_symbol
+            stock_name_for_news = stock_id
+
+        st.success(f"✅ 成功取得標的：【{display_name}】")
+
+        # ==========================================
+        # 2. 總體經濟環境
+        # ==========================================
+        macro_tickers = {'^TWII': '台灣加權指數', '^SOX': '費城半導體指數', '^TNX': '美10年期公債殖利率'}
+        macro_results, macro_score = {}, 0
+        for sym, name in macro_tickers.items():
+            try:
+                m_data = yf.Ticker(sym).history(period="6mo")['Close']
+                if not m_data.empty:
+                    curr_val, ma60 = m_data.iloc[-1], m_data.rolling(60).mean().iloc[-1]
+                    if sym == '^TNX':
+                        is_tailwind = curr_val < ma60
+                        macro_score += 1 if is_tailwind else -1
+                    else:
+                        is_tailwind = curr_val > ma60
+                        macro_score += 1 if is_tailwind else -1
+                    status = "🟢 偏多/寬鬆" if is_tailwind else "🔴 偏空/緊縮"
+                    macro_results[name] = f"目前 {curr_val:.2f} | 季線 {ma60:.2f} ➔ {status}"
+            except:
+                macro_results[name] = "⚠️ 無法取得"
+
+        env_status = "大環境順風 🌬️ (多頭動能強)" if macro_score >= 2 else "大環境逆風 🌪️ (系統性風險較高)" if macro_score <= -2 else "大環境中性 ⚖️ (震盪整理)"
+
+        # ==========================================
+        # 3. ⭐️ 恢復：基本面資料
+        # ==========================================
+        info = ticker.info
+        dividend_yield = info.get('dividendYield', 0)
+        trailing_yield = info.get('trailingAnnualDividendYield', 0)
+        final_yield = dividend_yield if dividend_yield else trailing_yield
+        yield_str = f"{final_yield:.2f}%" if final_yield > 1 else f"{final_yield * 100:.2f}%" if final_yield else "無資料"
+
+        pe_ratio = info.get('trailingPE', None)
+        pe_str = f"{pe_ratio:.2f} 倍" if pe_ratio else "無資料"
+        eps = info.get('trailingEps', None)
+        eps_str = f"{eps:.2f} 元" if eps else "無資料"
+        pb_ratio = info.get('priceToBook', None)
+        pb_str = f"{pb_ratio:.2f} 倍" if pb_ratio else "無資料"
+
+        # ==========================================
+        # 4. ⭐️ 恢復：FinMind 三大法人與 OBV 籌碼
+        # ==========================================
+        chip_text = ""
+        try:
+            start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+            url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
+            r = requests.get(url, timeout=5)
+            chip_data = r.json()
+
+            if chip_data.get('msg') == 'success' and len(chip_data.get('data', [])) > 0:
+                df_chips = pd.DataFrame(chip_data['data'])
+                df_chips['net_buy'] = (df_chips['buy'] - df_chips['sell']) / 1000
+                recent_date = df_chips['date'].max()
+                df_recent = df_chips[df_chips['date'] == recent_date]
+
+                foreign = df_recent[df_recent['name'] == 'Foreign_Investor']['net_buy'].sum()
+                trust = df_recent[df_recent['name'] == 'Investment_Trust']['net_buy'].sum()
+                dealer = df_recent[df_recent['name'].str.contains('Dealer')]['net_buy'].sum()
+
+                chip_text = f"最新交易日 ({recent_date})：外資 **{foreign:,.0f}** 張 | 投信 **{trust:,.0f}** 張 | 自營商 **{dealer:,.0f}** 張"
+            else:
+                chip_text = "⚠️ 無法取得三大法人最新數據"
+        except:
+            chip_text = "⚠️ 籌碼資料連線異常"
+
+        obv = [0]
+        for i in range(1, len(stock_data)):
+            if stock_data['Close'].iloc[i] > stock_data['Close'].iloc[i-1]:
+                obv.append(obv[-1] + stock_data['Volume'].iloc[i])
+            elif stock_data['Close'].iloc[i] < stock_data['Close'].iloc[i-1]:
+                obv.append(obv[-1] - stock_data['Volume'].iloc[i])
+            else:
+                obv.append(obv[-1])
+        stock_data['OBV'] = obv
+        obv_trend = "🟢 資金流入 (大戶偏多)" if stock_data['OBV'].iloc[-1] > stock_data['OBV'].iloc[-5] else "🔴 資金流出 (大戶偏空)"
+
+        # ==========================================
+        # 5. Prophet 模型預測
+        # ==========================================
+        df = stock_data.reset_index()
+        df['Date'] = df['Date'].dt.tz_localize(None)
+        df_prophet = df[['Date', 'Close']].rename(columns={'Date': 'ds', 'Close': 'y'}).dropna()
+        model = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True)
+        model.fit(df_prophet)
+        future = model.make_future_dataframe(periods=20) 
+        forecast = model.predict(future)
+
+
+        # =========================================================
+        # 🟢 輸出畫面：圖表區
+        # =========================================================
+        st.subheader("📊 AI 趨勢預測圖")
+        fig1 = model.plot(forecast, figsize=(10, 5))
+        ax = fig1.gca()
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        plt.title(f'{display_name} 股價 AI 預測', fontsize=14, fontweight='bold')
+        plt.xlabel('日期', fontsize=12)
+        plt.ylabel('股價', fontsize=12)
+        plt.grid(alpha=0.3)
+        st.pyplot(fig1)
+
+        # =========================================================
+        # 🟢 輸出畫面：決策指揮中心報告
+        # =========================================================
+        st.markdown("---")
+        st.subheader("📄 決策指揮中心報告")
+        
+        # 總體經濟
+        st.markdown(f"**🌍 總經大環境：** {env_status}")
+        for name, status in macro_results.items():
+            st.write(f"🔹 {name}: {status}")
+            
+        st.write("") # 空行
+            
+        # 基本面 (使用漂亮的數字卡片排版)
+        st.markdown("**💰 基本面評估：**")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("EPS", eps_str)
+        col2.metric("本益比", pe_str)
+        col3.metric("淨值比", pb_str)
+        col4.metric("殖利率", yield_str)
+
+        # 籌碼面
+        st.markdown("**🕵️‍♂️ 籌碼動能：**")
+        st.write(f"- OBV 近五日動能：{obv_trend}")
+        st.write(f"- 三大法人：{chip_text}")
+            
+        # =========================================================
+        # 🟢 輸出畫面：AI 推演
+        # =========================================================
+        st.markdown("---")
+        st.subheader("📈 AI 未來 5 個有效交易日推演")
+        future_predictions = forecast[forecast['ds'] > df_prophet['ds'].max()]
+        first_price, last_price = None, None
+        valid_days = 0
+        day_mapping = {0: '週一', 1: '週二', 2: '週三', 3: '週四', 4: '週五', 5: '週六', 6: '週日'}
+        tw_holidays = holidays.TW(years=[datetime.now().year, datetime.now().year + 1])
+        
+        for _, row in future_predictions.iterrows():
+            if valid_days >= 5: break
+            curr_date = row['ds']
+            weekday = curr_date.weekday()
+            
+            if weekday >= 5 or curr_date in tw_holidays: continue
+            
+            if first_price is None: first_price = row['yhat']
+            last_price = row['yhat']
+            
+            st.info(f"📅 **{curr_date.strftime('%Y-%m-%d')} ({day_mapping[weekday]})** | 期望價: **${row['yhat']:.2f}** (區間: ${row['yhat_lower']:.2f} ~ ${row['yhat_upper']:.2f})")
+            valid_days += 1
+
+        # =========================================================
+        # 🟢 輸出畫面：綜合策略建議
+        # =========================================================
+        st.markdown("---")
+        st.subheader("💡 AI 操盤總結與策略建議")
+        is_macro_good = macro_score >= 0 
+        is_trend_up = last_price > first_price if (last_price and first_price) else False 
+        is_obv_good = "流入" in obv_trend 
+        
+        st.write("📌 **當前盤勢結構 (多空交叉比對)：**")
+        st.write(f"1. 總經大環境：{'偏多 🟢' if is_macro_good else '偏空 / 保守 🔴'}")
+        st.write(f"2. 技術與籌碼：{'大戶資金流入 🟢' if is_obv_good else '大戶資金流出 🔴'}")
+        st.write(f"3. AI 短期預測：{'趨勢向上 🟢' if is_trend_up else '趨勢向下 🔴'}")
+        
+        st.write("🎯 **綜合行動建議：**")
+        if is_macro_good and is_trend_up and is_obv_good:
+            st.success("🔥 **【強勢多頭格局 - 積極做多】**\n\n大環境順風、大戶資金持續進駐，且 AI 預測未來走高，個股處於攻擊位置。可順勢放大資金部位。")
+        elif not is_macro_good and is_trend_up and is_obv_good:
+            st.info("⚡ **【逆風突圍 - 短線偏多】**\n\n大盤不佳，但特定資金逆勢進駐，屬逆勢抗跌股，建議以短進短出為主，嚴格設定停利點。")
+        elif is_macro_good and not is_trend_up and not is_obv_good:
+            st.warning("⚠️ **【順風修正 - 觀望回檔】**\n\n大環境好，但個股出現提款跡象。空手者先觀望，等待量縮止跌；持有者可考慮逢高減碼。")
+        elif not is_macro_good and not is_trend_up and not is_obv_good:
+            st.error("❄️ **【弱勢空頭格局 - 嚴控風險】**\n\n系統性風險較高，遭到大戶拋售，趨勢全面走弱，建議保持高現金水位，耐心等待翻轉。")
+        else:
+            st.info("⚖️ **【震盪整理 - 區間操作】**\n\n各項指標出現分歧，處於方向選擇過渡期，建議採取區間高出低進。若標的為 ETF，可檢視殖利率採定期定額。")
+            
+        # =========================================================
+        # 🟢 輸出畫面：⭐️ 恢復：完整新聞列表
+        # =========================================================
+        st.markdown("---")
+        st.subheader("📰 近期相關新聞")
+        try:
+            google_news = GNews(language='zh-Hant', country='TW', max_results=3)
+            news_items = google_news.get_news(f"{stock_name_for_news} 股票")
+            if news_items:
+                for i, news in enumerate(news_items, 1):
+                    title = news.get('title', '無標題')
+                    publisher = news.get('publisher', {}).get('title', '未知來源')
+                    pub_date = str(news.get('published date', ''))[:16]
+                    url = news.get('url', '#')
+                    
+                    st.markdown(f"**{i}. [{title}]({url})**")
+                    st.caption(f"來源: {publisher} | 時間: {pub_date}")
+            else:
+                st.write("目前找不到最新新聞。")
+        except:
+            st.write("新聞模組發生異常。")
