@@ -13,24 +13,33 @@ import requests
 import holidays
 import matplotlib.font_manager as fm
 import os
+import tempfile
 
 # --- 網頁設定 ---
 st.set_page_config(page_title="AI 股票決策指揮中心", page_icon="📈", layout="centered")
 st.title("📈 AI 股票預測與決策指揮中心")
 
-# --- 字型下載與設定 (使用 st.cache_resource 避免重複下載) ---
+# --- 🛠️ 防呆優化 1：安全寫入字型 (避免雲端權限問題) ---
 @st.cache_resource
 def load_font():
     font_url = 'https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf'
-    font_path = 'NotoSansCJKtc-Regular.otf'
+    font_path = os.path.join(tempfile.gettempdir(), 'NotoSansCJKtc-Regular.otf')
+    
     if not os.path.exists(font_path):
-        response = requests.get(font_url)
-        with open(font_path, 'wb') as f:
-            f.write(response.content)
-    fm.fontManager.addfont(font_path)
-    custom_font = fm.FontProperties(fname=font_path)
-    plt.rcParams['font.sans-serif'] = custom_font.get_name() 
-    plt.rcParams['axes.unicode_minus'] = False 
+        try:
+            response = requests.get(font_url, timeout=10)
+            with open(font_path, 'wb') as f:
+                f.write(response.content)
+        except Exception:
+            return
+            
+    try:
+        fm.fontManager.addfont(font_path)
+        custom_font = fm.FontProperties(fname=font_path)
+        plt.rcParams['font.sans-serif'] = custom_font.get_name() 
+        plt.rcParams['axes.unicode_minus'] = False 
+    except Exception:
+        pass
 
 load_font()
 
@@ -55,18 +64,23 @@ if analyze_button:
             
         stock_id = ticker_symbol.replace(".TW", "").replace(".TWO", "")
         
+        # 🛠️ 防呆優化 2：增加爬蟲安全防護
         try:
-            headers = {'User-Agent': 'Mozilla/5.0'}
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             url = f"https://tw.stock.yahoo.com/quote/{stock_id}"
             res = requests.get(url, headers=headers, timeout=5)
-            start_idx = res.text.find('<title>') + 7
-            end_idx = res.text.find('</title>')
-            chinese_name = res.text[start_idx:end_idx].split('(')[0].strip()
-            display_name = f"{ticker_symbol} {chinese_name}" if "Yahoo" not in chinese_name else ticker_symbol
-            stock_name_for_news = chinese_name if "Yahoo" not in chinese_name else stock_id
+            
+            start_idx = res.text.find('<title>')
+            if start_idx != -1:
+                start_idx += 7
+                end_idx = res.text.find('</title>')
+                chinese_name = res.text[start_idx:end_idx].split('(')[0].strip()
+                display_name = f"{ticker_symbol} {chinese_name}" if "Yahoo" not in chinese_name else ticker_symbol
+                stock_name_for_news = chinese_name if "Yahoo" not in chinese_name else stock_id
+            else:
+                display_name, stock_name_for_news = ticker_symbol, stock_id
         except:
-            display_name = ticker_symbol
-            stock_name_for_news = stock_id
+            display_name, stock_name_for_news = ticker_symbol, stock_id
 
         st.success(f"✅ 成功取得標的：【{display_name}】")
 
@@ -122,33 +136,43 @@ if analyze_button:
 
             if chip_data.get('msg') == 'success' and len(chip_data.get('data', [])) > 0:
                 df_chips = pd.DataFrame(chip_data['data'])
-                df_chips['net_buy'] = (df_chips['buy'] - df_chips['sell']) / 1000
-                recent_date = df_chips['date'].max()
-                df_recent = df_chips[df_chips['date'] == recent_date]
+                # 🛠️ 防呆優化 3：確保欄位存在
+                if 'buy' in df_chips.columns and 'sell' in df_chips.columns:
+                    df_chips['net_buy'] = (df_chips['buy'] - df_chips['sell']) / 1000
+                    recent_date = df_chips['date'].max()
+                    df_recent = df_chips[df_chips['date'] == recent_date]
 
-                foreign = df_recent[df_recent['name'] == 'Foreign_Investor']['net_buy'].sum()
-                trust = df_recent[df_recent['name'] == 'Investment_Trust']['net_buy'].sum()
-                dealer = df_recent[df_recent['name'].str.contains('Dealer')]['net_buy'].sum()
+                    foreign = df_recent[df_recent['name'] == 'Foreign_Investor']['net_buy'].sum()
+                    trust = df_recent[df_recent['name'] == 'Investment_Trust']['net_buy'].sum()
+                    dealer = df_recent[df_recent['name'].str.contains('Dealer')]['net_buy'].sum()
 
-                chip_text = f"最新 ({recent_date})：外資 **{foreign:,.0f}** 張 | 投信 **{trust:,.0f}** 張 | 自營商 **{dealer:,.0f}** 張"
+                    chip_text = f"最新 ({recent_date})：外資 **{foreign:,.0f}** 張 | 投信 **{trust:,.0f}** 張 | 自營商 **{dealer:,.0f}** 張"
+                else:
+                    chip_text = "⚠️ 法人資料格式異動"
             else:
                 chip_text = "⚠️ 無法取得三大法人最新數據"
         except:
             chip_text = "⚠️ 籌碼資料連線異常"
 
+        # 🛠️ 防呆優化 4：確保 OBV 計算長度安全
         obv = [0]
-        for i in range(1, len(stock_data)):
-            if stock_data['Close'].iloc[i] > stock_data['Close'].iloc[i-1]:
-                obv.append(obv[-1] + stock_data['Volume'].iloc[i])
-            elif stock_data['Close'].iloc[i] < stock_data['Close'].iloc[i-1]:
-                obv.append(obv[-1] - stock_data['Volume'].iloc[i])
-            else:
-                obv.append(obv[-1])
+        if len(stock_data) > 1:
+            for i in range(1, len(stock_data)):
+                if stock_data['Close'].iloc[i] > stock_data['Close'].iloc[i-1]:
+                    obv.append(obv[-1] + stock_data['Volume'].iloc[i])
+                elif stock_data['Close'].iloc[i] < stock_data['Close'].iloc[i-1]:
+                    obv.append(obv[-1] - stock_data['Volume'].iloc[i])
+                else:
+                    obv.append(obv[-1])
         stock_data['OBV'] = obv
-        obv_trend = "🟢 資金流入 (大戶偏多)" if stock_data['OBV'].iloc[-1] > stock_data['OBV'].iloc[-5] else "🔴 資金流出 (大戶偏空)"
+        
+        if len(stock_data) >= 5:
+            obv_trend = "🟢 資金流入 (大戶偏多)" if stock_data['OBV'].iloc[-1] > stock_data['OBV'].iloc[-5] else "🔴 資金流出 (大戶偏空)"
+        else:
+            obv_trend = "⚪ 資料不足無法計算"
 
         # =========================================================
-        # 5. 🌟 Prophet 模型預測 (已套用你附件中的終極調校)
+        # 5. Prophet 模型預測
         # =========================================================
         df = stock_data.reset_index()
         df['Date'] = df['Date'].dt.tz_localize(None)
@@ -156,24 +180,26 @@ if analyze_button:
         
         model = Prophet(
             daily_seasonality=False, 
-            weekly_seasonality=False,     # 🚫 關閉週季節性
-            yearly_seasonality=False,     # 🚫 關閉年季節性
-            changepoint_prior_scale=0.15, # ⚖️ 微調為 0.15
-            changepoint_range=0.98        # 🔍 將偵測推至最後一刻
+            weekly_seasonality=False,     
+            yearly_seasonality=False,     
+            changepoint_prior_scale=0.15, 
+            changepoint_range=0.98        
         )
         model.fit(df_prophet)
 
         future = model.make_future_dataframe(periods=30) 
-        future = future[future['ds'].dt.weekday < 5] # 🌟 剔除週末盲區
+        future = future[future['ds'].dt.weekday < 5] 
         forecast = model.predict(future)
 
-
         # =========================================================
-        # 🟢 輸出畫面：圖表區 (已套用你的網格與標籤優化)
+        # 🟢 輸出畫面：圖表區
         # =========================================================
         st.subheader("📊 AI 趨勢預測圖")
-        fig1 = model.plot(forecast, figsize=(10, 5))
-        ax = fig1.gca()
+        
+        # 🛠️ 防呆優化 5：安全繪圖，避免 Matplotlib 產生執行緒衝突
+        fig1, ax = plt.subplots(figsize=(10, 5))
+        model.plot(forecast, ax=ax)
+        
         ax.xaxis.set_major_locator(mdates.MonthLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
         plt.xticks(rotation=45)
@@ -198,14 +224,12 @@ if analyze_button:
         st.markdown("---")
         st.subheader("📄 決策指揮中心報告")
         
-        # 總體經濟
         st.markdown(f"**🌍 總經大環境：** {env_status}")
         for name, status in macro_results.items():
             st.write(f"🔹 {name}: {status}")
             
         st.write("") 
             
-        # 基本面 (使用漂亮的數字卡片排版)
         st.markdown("**💰 基本面評估：**")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("EPS", eps_str)
@@ -213,13 +237,12 @@ if analyze_button:
         col3.metric("淨值比", pb_str)
         col4.metric("殖利率", yield_str)
 
-        # 籌碼面
         st.markdown("**🕵️‍♂️ 籌碼動能：**")
         st.write(f"- OBV 近五日動能：{obv_trend}")
         st.write(f"- 三大法人：{chip_text}")
             
         # =========================================================
-        # 🟢 輸出畫面：AI 推演 (已配合週末剔除邏輯調整)
+        # 🟢 輸出畫面：AI 推演
         # =========================================================
         st.markdown("---")
         st.subheader("📈 AI 未來 5 個有效交易日推演")
@@ -230,16 +253,21 @@ if analyze_button:
         first_price, last_price = None, None
         valid_days = 0
         day_mapping = {0: '週一', 1: '週二', 2: '週三', 3: '週四', 4: '週五', 5: '週六', 6: '週日'}
-        tw_holidays = holidays.TW(years=[datetime.now().year, datetime.now().year + 1])
+        
+        # 🛠️ 防呆優化 6：相容不同版本的 holidays 套件
+        try:
+            tw_holidays = holidays.country_holidays('TW', years=[datetime.now().year, datetime.now().year + 1])
+        except:
+            tw_holidays = holidays.TW(years=[datetime.now().year, datetime.now().year + 1])
         
         for _, row in future_predictions.iterrows():
             if valid_days >= 5: break
             curr_date = row['ds']
             weekday = curr_date.weekday()
             
-            # 已預先剔除週末，此處僅保留國定假日判斷
-            if curr_date in tw_holidays: 
-                holiday_name = tw_holidays.get(current_date)
+            # 🛠️ 防呆優化 7：將 Timestamp 轉為純 date 格式，避免比對錯誤
+            if curr_date.date() in tw_holidays: 
+                holiday_name = tw_holidays.get(curr_date.date())
                 st.warning(f"📅 **{curr_date.strftime('%Y-%m-%d')} ({day_mapping[weekday]})** | 🛑 今日休市 ({holiday_name})，暫無交易預測")
                 continue
             
@@ -265,7 +293,7 @@ if analyze_button:
         
         st.write("🎯 **綜合行動建議：**")
         if is_macro_good and is_trend_up and is_obv_good:
-            st.success("🔥 **【強勢多頭格局 - 積極做多】**\n\n狀態：大環境順風、大戶資金持續進駐，且 AI 預測未來 5 日走高，個股處於極佳的攻擊位置。\n\n策略：可順勢放大資金部位。持有者建議續抱讓利潤奔跑；空手者若遇盤中量縮回檔，可視為切入點。")
+            st.success("🔥 **【強勢多頭格局 - 積極做多】**\n\n狀態：大環境順風、大戶資金持續進駐，且 AI 預測未來走高，個股處於極佳的攻擊位置。\n\n策略：可順勢放大資金部位。持有者建議續抱讓利潤奔跑；空手者若遇盤中量縮回檔，可視為切入點。")
         elif not is_macro_good and is_trend_up and is_obv_good:
             st.info("⚡ **【逆風突圍 / 跌深反彈 - 短線偏多】**\n\n狀態：大盤環境不佳，但該股有特定資金逆勢進駐，AI 預測短線有上漲空間。\n\n策略：屬於「逆勢抗跌股」。建議以「短進短出」為主，嚴格控制資金水位，並設定移動停利點。")
         elif is_macro_good and not is_trend_up and not is_obv_good:
